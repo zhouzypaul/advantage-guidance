@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
+from agents.common import get_flat_batch
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import MLP_CLASSES, GaussianActor, LogParam, Value
 
@@ -22,33 +23,32 @@ class SACAgent(flax.struct.PyTreeNode):
 
     def critic_loss(self, batch, grad_params, rng):
         """Compute the SAC critic loss."""
+        batch_actions, next_obs, rewards, masks, valid_w = get_flat_batch(
+            batch, self.config
+        )
+        discount = self.config["discount"] ** self.config["horizon_length"]
         rng, sample_rng = jax.random.split(rng)
-        next_dist = self.network.select("actor")(batch["next_observations"])
+        next_dist = self.network.select("actor")(next_obs)
         next_actions, next_log_probs = next_dist.sample_and_log_prob(seed=sample_rng)
 
-        next_qs = self.network.select("target_critic")(
-            batch["next_observations"], next_actions
-        )
+        next_qs = self.network.select("target_critic")(next_obs, next_actions)
         if self.config["q_agg"] == "min":
             next_q = next_qs.min(axis=0)
         else:
             next_q = next_qs.mean(axis=0)
 
-        target_q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_q
+        target_q = rewards + discount * masks * next_q
         if self.config["backup_entropy"]:
             # Add the entropy term to the target Q value.
             target_q = (
                 target_q
-                - self.config["discount"]
-                * batch["masks"]
-                * next_log_probs
-                * self.network.select("alpha")()
+                - discount * masks * next_log_probs * self.network.select("alpha")()
             )
 
         q = self.network.select("critic")(
-            batch["observations"], batch["actions"], params=grad_params
+            batch["observations"], batch_actions, params=grad_params
         )
-        critic_loss = jnp.square(q - target_q).mean()
+        critic_loss = (jnp.square(q - target_q) * valid_w).mean()
 
         return critic_loss, {
             "critic_loss": critic_loss,
@@ -59,6 +59,7 @@ class SACAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng):
         """Compute the SAC actor loss."""
+        batch_actions, _, _, _, valid_w = get_flat_batch(batch, self.config)
         dist = self.network.select("actor")(batch["observations"], params=grad_params)
         actions, log_probs = dist.sample_and_log_prob(seed=rng)
 
@@ -66,15 +67,17 @@ class SACAgent(flax.struct.PyTreeNode):
         qs = self.network.select("critic")(batch["observations"], actions)
         q = jnp.mean(qs, axis=0)
 
-        actor_loss = (log_probs * self.network.select("alpha")() - q).mean()
+        actor_loss = ((log_probs * self.network.select("alpha")() - q) * valid_w).mean()
 
         # Entropy loss.
         alpha = self.network.select("alpha")(params=grad_params)
-        entropy = -jax.lax.stop_gradient(log_probs).mean()
-        alpha_loss = (alpha * (entropy - self.config["target_entropy"])).mean()
+        entropy = -jax.lax.stop_gradient(log_probs)
+        alpha_loss = (
+            alpha * (entropy - self.config["target_entropy"]) * valid_w
+        ).mean()
 
         # BC loss.
-        bc_loss = jnp.square(actions - batch["actions"]).mean()
+        bc_loss = (jnp.square(actions - batch_actions).mean(axis=-1) * valid_w).mean()
 
         total_loss = actor_loss + alpha_loss + bc_loss * self.config["bc_loss_weight"]
 
@@ -90,7 +93,7 @@ class SACAgent(flax.struct.PyTreeNode):
             "bc_loss": bc_loss,
             "bc_loss_weight": self.config["bc_loss_weight"],
             "alpha": alpha,
-            "entropy": -log_probs.mean(),
+            "entropy": entropy.mean(),
             "std": action_std.mean(),
             "q": q.mean(),
         }
@@ -168,10 +171,16 @@ class SACAgent(flax.struct.PyTreeNode):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
-        action_dim = ex_actions.shape[-1]
+        if config["action_chunking"]:
+            ex_actions = jnp.concatenate(
+                [ex_actions] * config["horizon_length"], axis=-1
+            )
+        full_action_dim = ex_actions.shape[-1]
 
         if config["target_entropy"] is None:
-            config["target_entropy"] = -config["target_entropy_multiplier"] * action_dim
+            config["target_entropy"] = (
+                -config["target_entropy_multiplier"] * full_action_dim
+            )
 
         # Define networks.
         critic_def = Value(
@@ -181,7 +190,7 @@ class SACAgent(flax.struct.PyTreeNode):
         )
         actor_def = GaussianActor(
             hidden_dims=config["actor_hidden_dims"],
-            action_dim=action_dim,
+            action_dim=full_action_dim,
             layer_norm=config["actor_layer_norm"],
             tanh_squash=config["tanh_squash"],
             state_dependent_std=config["state_dependent_std"],
@@ -226,6 +235,9 @@ def get_config():
                 hidden_dims=(512, 512, 512, 512),
                 layer_norm=True,
             ),
+            # n-step returns and action chunking.
+            horizon_length=1,
+            action_chunking=False,
             # RL hyperparameters.
             discount=0.99,
             tau=0.005,

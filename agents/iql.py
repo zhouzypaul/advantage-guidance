@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
+from agents.common import get_flat_batch
 from utils.activation import get_activation
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
@@ -34,12 +35,15 @@ class IQLAgent(flax.struct.PyTreeNode):
 
     def value_loss(self, batch, grad_params):
         """Compute the IQL value loss."""
+        batch_actions, _, _, _, valid_w = get_flat_batch(batch, self.config)
         q1, q2 = self.network.select("target_critic")(
-            batch["observations"], actions=batch["actions"]
+            batch["observations"], actions=batch_actions
         )
         q = jnp.minimum(q1, q2)
         v = self.network.select("value")(batch["observations"], params=grad_params)
-        value_loss = self.expectile_loss(q - v, q - v, self.config["expectile"]).mean()
+        value_loss = (
+            self.expectile_loss(q - v, q - v, self.config["expectile"]) * valid_w
+        ).mean()
 
         return value_loss, {
             "value_loss": value_loss,
@@ -50,13 +54,19 @@ class IQLAgent(flax.struct.PyTreeNode):
 
     def critic_loss(self, batch, grad_params):
         """Compute the IQL critic loss."""
-        next_v = self.network.select("value")(batch["next_observations"])
-        q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_v
+        batch_actions, next_obs, rewards, masks, valid_w = get_flat_batch(
+            batch, self.config
+        )
+        next_v = self.network.select("value")(next_obs)
+        q = (
+            rewards
+            + self.config["discount"] ** self.config["horizon_length"] * masks * next_v
+        )
 
         q1, q2 = self.network.select("critic")(
-            batch["observations"], actions=batch["actions"], params=grad_params
+            batch["observations"], actions=batch_actions, params=grad_params
         )
-        critic_loss = ((q1 - q) ** 2 + (q2 - q) ** 2).mean()
+        critic_loss = (((q1 - q) ** 2 + (q2 - q) ** 2) * valid_w).mean()
 
         return critic_loss, {
             "critic_loss": critic_loss,
@@ -67,12 +77,13 @@ class IQLAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng=None):
         """Compute the actor loss (AWR or DDPG+BC)."""
+        batch_actions, _, _, _, valid_w = get_flat_batch(batch, self.config)
         if self.config["actor_loss"] == "awr":
             # AWR loss.
             v = self.network.select("value")(batch["observations"])
             q1, q2 = self.network.select(
                 "target_critic" if self.config["target_extraction"] else "critic"
-            )(batch["observations"], actions=batch["actions"])
+            )(batch["observations"], actions=batch_actions)
             q = jnp.minimum(q1, q2)
             adv = q - v
 
@@ -82,15 +93,15 @@ class IQLAgent(flax.struct.PyTreeNode):
             dist = self.network.select("actor")(
                 batch["observations"], params=grad_params
             )
-            log_prob = dist.log_prob(batch["actions"])
+            log_prob = dist.log_prob(batch_actions)
 
-            actor_loss = -(exp_a * log_prob).mean()
+            actor_loss = -(exp_a * log_prob * valid_w).mean()
 
             actor_info = {
                 "actor_loss": actor_loss,
                 "adv": adv.mean(),
                 "bc_log_prob": log_prob.mean(),
-                "mse": jnp.mean((dist.mode() - batch["actions"]) ** 2),
+                "mse": jnp.mean((dist.mode() - batch_actions) ** 2),
                 "std": jnp.mean(dist.scale_diag),
             }
 
@@ -110,10 +121,12 @@ class IQLAgent(flax.struct.PyTreeNode):
             q = jnp.minimum(q1, q2)
 
             # Normalize Q values by the absolute mean to make the loss scale invariant.
-            q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean())
-            log_prob = dist.log_prob(batch["actions"])
+            q_loss = -(q * valid_w).mean() / jax.lax.stop_gradient(
+                jnp.maximum((jnp.abs(q) * valid_w).mean(), 1e-8)
+            )
+            log_prob = dist.log_prob(batch_actions)
 
-            bc_loss = -(self.config["alpha"] * log_prob).mean()
+            bc_loss = -(self.config["alpha"] * log_prob * valid_w).mean()
 
             actor_loss = q_loss + bc_loss
 
@@ -124,7 +137,7 @@ class IQLAgent(flax.struct.PyTreeNode):
                 "q_mean": q.mean(),
                 "q_abs_mean": jnp.abs(q).mean(),
                 "bc_log_prob": log_prob.mean(),
-                "mse": jnp.mean((dist.mode() - batch["actions"]) ** 2),
+                "mse": jnp.mean((dist.mode() - batch_actions) ** 2),
                 "std": jnp.mean(dist.scale_diag),
             }
         else:
@@ -187,7 +200,9 @@ class IQLAgent(flax.struct.PyTreeNode):
         q = self.network.select("critic")(
             jnp.repeat(observations[None], rejection_sampling, axis=0), actions=actions
         ).min(axis=0)
-        actions = actions[jnp.argmax(q, axis=0), jnp.arange(observations.shape[0])]
+        actions = jnp.take_along_axis(
+            actions, jnp.argmax(q, axis=0)[None, ..., None], axis=0
+        )[0]
 
         return actions
 
@@ -210,7 +225,11 @@ class IQLAgent(flax.struct.PyTreeNode):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
-        action_dim = ex_actions.shape[-1]
+        if config["action_chunking"]:
+            ex_actions = jnp.concatenate(
+                [ex_actions] * config["horizon_length"], axis=-1
+            )
+        full_action_dim = ex_actions.shape[-1]
 
         # Define encoders.
         encoders = dict()
@@ -244,7 +263,7 @@ class IQLAgent(flax.struct.PyTreeNode):
         )
         actor_def = GaussianActor(
             hidden_dims=config["actor_hidden_dims"],
-            action_dim=action_dim,
+            action_dim=full_action_dim,
             layer_norm=config["actor_layer_norm"],
             activation=activation_fn,
             state_dependent_std=False,
@@ -293,6 +312,9 @@ def get_config(variant=None):
             encoder=ml_collections.config_dict.placeholder(
                 str
             ),  # Visual encoder name (None, 'impala_small', etc.).
+            # n-step returns and action chunking.
+            horizon_length=1,
+            action_chunking=False,
             # RL hyperparameters.
             discount=0.99,
             tau=0.005,

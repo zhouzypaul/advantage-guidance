@@ -30,7 +30,10 @@ def _format_flag(key: str, value) -> str:
 
 
 def _flags_from_args(args: dict) -> list[str]:
-    return [_format_flag(key, value) for key, value in args.items()]
+    # ml_collections requires config-file flags before their field overrides.
+    return [
+        _format_flag(key, args[key]) for key in sorted(args, key=lambda k: k.count("."))
+    ]
 
 
 def _flag_value_for_sort(command: str, sort_by: str):
@@ -64,7 +67,7 @@ def _slurm_array_directive(num_array_tasks: int, concurrency_limit: int | None) 
 
 _RUNNER_HEADER = """\
 #!/usr/bin/env bash
-set -uo pipefail
+set -euo pipefail
 
 """
 

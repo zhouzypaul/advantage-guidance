@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
+from agents.common import get_flat_batch
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import MLP_CLASSES, ActorFlowField, Value
@@ -31,12 +32,15 @@ class IFQLAgent(flax.struct.PyTreeNode):
 
     def value_loss(self, batch, grad_params):
         """Compute the IQL value loss."""
+        batch_actions, _, _, _, valid_w = get_flat_batch(batch, self.config)
         q1, q2 = self.network.select("target_critic")(
-            batch["observations"], actions=batch["actions"]
+            batch["observations"], actions=batch_actions
         )
         q = jnp.minimum(q1, q2)
         v = self.network.select("value")(batch["observations"], params=grad_params)
-        value_loss = self.expectile_loss(q - v, q - v, self.config["expectile"]).mean()
+        value_loss = (
+            self.expectile_loss(q - v, q - v, self.config["expectile"]) * valid_w
+        ).mean()
 
         return value_loss, {
             "value_loss": value_loss,
@@ -47,13 +51,19 @@ class IFQLAgent(flax.struct.PyTreeNode):
 
     def critic_loss(self, batch, grad_params):
         """Compute the IQL critic loss."""
-        next_v = self.network.select("value")(batch["next_observations"])
-        q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_v
+        batch_actions, next_obs, rewards, masks, valid_w = get_flat_batch(
+            batch, self.config
+        )
+        next_v = self.network.select("value")(next_obs)
+        q = (
+            rewards
+            + self.config["discount"] ** self.config["horizon_length"] * masks * next_v
+        )
 
         q1, q2 = self.network.select("critic")(
-            batch["observations"], actions=batch["actions"], params=grad_params
+            batch["observations"], actions=batch_actions, params=grad_params
         )
-        critic_loss = ((q1 - q) ** 2 + (q2 - q) ** 2).mean()
+        critic_loss = (((q1 - q) ** 2 + (q2 - q) ** 2) * valid_w).mean()
 
         return critic_loss, {
             "critic_loss": critic_loss,
@@ -64,11 +74,12 @@ class IFQLAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng=None):
         """Compute the behavioral flow-matching actor loss."""
-        batch_size, action_dim = batch["actions"].shape
+        batch_actions, _, _, _, valid_w = get_flat_batch(batch, self.config)
+        batch_size, action_dim = batch_actions.shape
         rng, x_rng, t_rng = jax.random.split(rng, 3)
 
         x_0 = jax.random.normal(x_rng, (batch_size, action_dim))
-        x_1 = batch["actions"]
+        x_1 = batch_actions
         t = jax.random.uniform(t_rng, (batch_size, 1))
         x_t = (1 - t) * x_0 + t * x_1
         vel = x_1 - x_0
@@ -76,7 +87,7 @@ class IFQLAgent(flax.struct.PyTreeNode):
         pred = self.network.select("actor_flow")(
             batch["observations"], x_t, t, params=grad_params
         )
-        actor_loss = jnp.mean((pred - vel) ** 2)
+        actor_loss = (((pred - vel) ** 2).mean(axis=-1) * valid_w).mean()
 
         return actor_loss, {
             "actor_loss": actor_loss,
@@ -136,15 +147,20 @@ class IFQLAgent(flax.struct.PyTreeNode):
         orig_observations = observations
         if self.config["encoder"] is not None:
             observations = self.network.select("actor_flow_encoder")(observations)
-        action_seed, noise_seed = jax.random.split(seed)
+        action_seed, _ = jax.random.split(seed)
 
         # Sample `num_samples` noises and propagate them through the flow.
         actions = jax.random.normal(
             action_seed,
             (
-                *observations.shape[:-1],
                 self.config["num_samples"],
-                self.config["action_dim"],
+                *observations.shape[:-1],
+                self.config["action_dim"]
+                * (
+                    self.config["horizon_length"]
+                    if self.config["action_chunking"]
+                    else 1
+                ),
             ),
         )
         n_observations = jnp.repeat(
@@ -155,7 +171,7 @@ class IFQLAgent(flax.struct.PyTreeNode):
         )
         for i in range(self.config["flow_steps"]):
             t = jnp.full(
-                (*observations.shape[:-1], self.config["num_samples"], 1),
+                (self.config["num_samples"], *observations.shape[:-1], 1),
                 i / self.config["flow_steps"],
             )
             vels = self.network.select("actor_flow")(
@@ -168,7 +184,9 @@ class IFQLAgent(flax.struct.PyTreeNode):
         q = self.network.select("critic")(n_orig_observations, actions=actions).min(
             axis=0
         )
-        actions = actions[jnp.argmax(q)]
+        actions = jnp.take_along_axis(
+            actions, jnp.argmax(q, axis=0)[None, ..., None], axis=0
+        )[0]
         return actions
 
     @classmethod
@@ -192,6 +210,11 @@ class IFQLAgent(flax.struct.PyTreeNode):
 
         ex_times = ex_actions[..., :1]
         action_dim = ex_actions.shape[-1]
+        if config["action_chunking"]:
+            ex_actions = jnp.concatenate(
+                [ex_actions] * config["horizon_length"], axis=-1
+            )
+        full_action_dim = ex_actions.shape[-1]
 
         # Define encoders.
         encoders = dict()
@@ -216,7 +239,7 @@ class IFQLAgent(flax.struct.PyTreeNode):
         )
         actor_flow_def = ActorFlowField(
             config["actor_hidden_dims"],
-            action_dim,
+            full_action_dim,
             mlp_kwargs=dict(layer_norm=config["actor_layer_norm"]),
             encoder=encoders.get("actor_flow"),
             time_embedding="raw",
@@ -269,6 +292,9 @@ def get_config():
             encoder=ml_collections.config_dict.placeholder(
                 str
             ),  # Visual encoder name (None, 'impala_small', etc.).
+            # n-step returns and action chunking.
+            horizon_length=1,
+            action_chunking=False,
             # RL hyperparameters.
             discount=0.99,
             tau=0.005,

@@ -62,7 +62,7 @@ For example, run AG on OGBench Puzzle 3×3 T1:
 MUJOCO_GL=egl uv run python main.py \
   --agent=agents/advantage_guidance.py \
   --agent.num_imagined_actions=7 \
-  --agent.residual_parameterization = True \
+  --agent.residual_parameterization=True \
   --agent.adv_gaussian_std=0.1 \
   --guidance_weights=0,0.75,1,1.25,1.5,2,2.5,4 \
   --agent.action_chunking=True \
@@ -70,7 +70,7 @@ MUJOCO_GL=egl uv run python main.py \
   --env_name=puzzle-3x3-play-singletask-task1-v0 \
   --offline_steps=500000 \
   --eval_episodes=30 \
-  --eval_vecenv_size=10 \
+  --eval_vecenv_size=10
 ```
 
 The `--env_name` values used in the paper are `cube-single-play-singletask-task<1-5>-v0`, `cube-double-play-singletask-task<1-5>-v0`, `scene-play-singletask-task<1-5>-v0`, `puzzle-3x3-play-singletask-task<1-5>-v0`, `block-lite-single-task1-v0`, `block-lite-double-task<1-2>-v0`, and `chamber-lite-easy-task<1-3>-v0`. The `--guidance_weights` flag evaluates every listed weight at each evaluation interval and logs a separate success rate for each. Checkpoints are saved to  `exp/advantage-guidance/<wandb_run_group>/<run_name>/params_<step>.pkl`, alongside CSV logs.

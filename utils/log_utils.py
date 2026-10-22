@@ -35,28 +35,20 @@ class CsvLogger:
 
     def log(self, row, step):
         row["step"] = step
+        # Per-sample arrays can contain newlines and must not become CSV cells.
+        filtered_row = {
+            k: v
+            for k, v in row.items()
+            if not isinstance(v, self.disallowed_types) and np.ndim(v) == 0
+        }
         if self.file is None:
             self.file = open(self.path, "w")
             if self.header is None:
-                self.header = [
-                    k
-                    for k, v in row.items()
-                    if not isinstance(v, self.disallowed_types)
-                ]
+                self.header = list(filtered_row)
                 self.file.write(",".join(self.header) + "\n")
-            filtered_row = {
-                k: v for k, v in row.items() if not isinstance(v, self.disallowed_types)
-            }
-            self.file.write(
-                ",".join([str(filtered_row.get(k, "")) for k in self.header]) + "\n"
-            )
-        else:
-            filtered_row = {
-                k: v for k, v in row.items() if not isinstance(v, self.disallowed_types)
-            }
-            self.file.write(
-                ",".join([str(filtered_row.get(k, "")) for k in self.header]) + "\n"
-            )
+        self.file.write(
+            ",".join([str(filtered_row.get(k, "")) for k in self.header]) + "\n"
+        )
         self.file.flush()
 
     def close(self):

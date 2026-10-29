@@ -44,25 +44,27 @@ class MLP(nn.Module):
     kernel_init: Any = default_init()
     layer_norm: bool = False
     dtype: Any = None
-    layer_norm_affine: bool = False
+    layer_norm_affine: bool = False  # Only controls adaptive LayerNorm.
 
     @nn.compact
     def __call__(self, x, condition_features=None):
+        if condition_features is not None and not self.layer_norm:
+            raise ValueError("Conditioned inputs require layer_norm=True.")
         for i, size in enumerate(self.hidden_dims):
             x = nn.Dense(
                 size,
                 kernel_init=self.kernel_init,
                 dtype=self.dtype,
             )(x)
-            # Ordinary MLPs omit final-layer normalization; conditioned trunks use AdaLN throughout.
-            x = _layer_norm_and_inject_condition(
-                x,
-                condition_features,
-                layer_norm=self.layer_norm
-                and (i + 1 < len(self.hidden_dims) or condition_features is not None),
-                layer_norm_affine=self.layer_norm_affine,
-                dtype=self.dtype,
-            )
+            if condition_features is not None:
+                x = _adaptive_layer_norm(
+                    x,
+                    condition_features,
+                    layer_norm_affine=self.layer_norm_affine,
+                    dtype=self.dtype,
+                )
+            elif i + 1 < len(self.hidden_dims) and self.layer_norm:
+                x = nn.LayerNorm(dtype=self.dtype)(x)
             if i + 1 < len(self.hidden_dims) or self.activate_final:
                 x = self.activation(x)
             if i == len(self.hidden_dims) - 2:
@@ -70,24 +72,21 @@ class MLP(nn.Module):
         return x
 
 
-def _layer_norm_and_inject_condition(
-    x, condition_features, *, layer_norm, layer_norm_affine, dtype
-):
-    """Apply ordinary normalization, or AdaLN when condition features are supplied."""
-    if layer_norm:
-        x = nn.LayerNorm(
-            use_scale=layer_norm_affine, use_bias=layer_norm_affine, dtype=dtype
-        )(x)
-    if condition_features is not None:
-        scale_shift = nn.Dense(
-            2 * x.shape[-1],
-            kernel_init=nn.initializers.zeros_init(),
-            bias_init=nn.initializers.zeros_init(),
-            dtype=dtype,
-        )(condition_features)
-        scale, shift = jnp.split(scale_shift, 2, axis=-1)
-        x = x * (1.0 + scale) + shift
-    return x
+def _adaptive_layer_norm(x, condition_features, *, layer_norm_affine, dtype):
+    """Normalize features, then apply condition-dependent scale and shift.
+    layer_norm_affine: False corresponds to AdaLN, True corresponds to FiLM.
+    """
+    x = nn.LayerNorm(
+        use_scale=layer_norm_affine, use_bias=layer_norm_affine, dtype=dtype
+    )(x)
+    scale_shift = nn.Dense(
+        2 * x.shape[-1],
+        kernel_init=nn.initializers.zeros_init(),
+        bias_init=nn.initializers.zeros_init(),
+        dtype=dtype,
+    )(condition_features)
+    scale, shift = jnp.split(scale_shift, 2, axis=-1)
+    return x * (1.0 + scale) + shift
 
 
 class ResidualBlock(nn.Module):
@@ -98,30 +97,36 @@ class ResidualBlock(nn.Module):
     kernel_init: Any = default_init()
     layer_norm: bool = True
     dtype: Any = None
-    layer_norm_affine: bool = False
+    layer_norm_affine: bool = False  # Only controls adaptive LayerNorm.
 
     @nn.compact
     def __call__(self, x, condition_features=None):
+        if condition_features is not None and not self.layer_norm:
+            raise ValueError("Conditioned inputs require layer_norm=True.")
         residual = x
         x = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init, dtype=self.dtype)(x)
         x = self.activation(x)
-        x = _layer_norm_and_inject_condition(
-            x,
-            condition_features,
-            layer_norm=self.layer_norm,
-            layer_norm_affine=self.layer_norm_affine,
-            dtype=self.dtype,
-        )
+        if condition_features is not None:
+            x = _adaptive_layer_norm(
+                x,
+                condition_features,
+                layer_norm_affine=self.layer_norm_affine,
+                dtype=self.dtype,
+            )
+        elif self.layer_norm:
+            x = nn.LayerNorm(dtype=self.dtype)(x)
         x = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init, dtype=self.dtype)(x)
         x = residual + x
         x = self.activation(x)
-        x = _layer_norm_and_inject_condition(
-            x,
-            condition_features,
-            layer_norm=self.layer_norm,
-            layer_norm_affine=self.layer_norm_affine,
-            dtype=self.dtype,
-        )
+        if condition_features is not None:
+            x = _adaptive_layer_norm(
+                x,
+                condition_features,
+                layer_norm_affine=self.layer_norm_affine,
+                dtype=self.dtype,
+            )
+        elif self.layer_norm:
+            x = nn.LayerNorm(dtype=self.dtype)(x)
         return x
 
 
@@ -134,10 +139,12 @@ class ResidualMLP(nn.Module):
     kernel_init: Any = default_init()
     layer_norm: bool = True
     dtype: Any = None
-    layer_norm_affine: bool = False
+    layer_norm_affine: bool = False  # Only controls adaptive LayerNorm.
 
     @nn.compact
     def __call__(self, x, condition_features=None):
+        if condition_features is not None and not self.layer_norm:
+            raise ValueError("Conditioned inputs require layer_norm=True.")
         if len(self.hidden_dims) % 2:
             raise ValueError(
                 f"ResidualMLP requires an even number of hidden layers; got {len(self.hidden_dims)}."
@@ -150,13 +157,8 @@ class ResidualMLP(nn.Module):
 
         x = nn.Dense(hidden_dim, kernel_init=self.kernel_init, dtype=self.dtype)(x)
         x = self.activation(x)
-        x = _layer_norm_and_inject_condition(
-            x,
-            None,
-            layer_norm=self.layer_norm,
-            layer_norm_affine=self.layer_norm_affine,
-            dtype=self.dtype,
-        )
+        if self.layer_norm:
+            x = nn.LayerNorm(dtype=self.dtype)(x)
 
         for _ in range(len(self.hidden_dims) // 2):
             x = ResidualBlock(
